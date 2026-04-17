@@ -1,0 +1,19 @@
+[package]
+name = "mmd-viewer"
+version = "0.1.0"
+edition = "2021"
+description = "Instantly render Mermaid diagrams in your browser from the CLI"
+homepage = "https://github.com/MariusAdrian88/mmd-viewer"
+repository = "https://github.com/MariusAdrian88/mmd-viewer"
+license = "MIT"
+keywords = ["mermaid", "diagram", "cli", "viewer", "browser"]
+categories = ["command-line-utilities", "visualization"]
+
+[dependencies]
+webbrowser = "1.0"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1

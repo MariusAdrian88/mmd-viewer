@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-04-18
+
+### Added
+
+- Full REPL command system with `rustyline` for line editing and persistent history
+- `:theme` command to switch diagram themes (default, dark, forest, neutral, base)
+- `:save` command to export last rendered HTML to a file
+- `:load` command to render diagrams from `.mmd` files
+- `:last` command to re-render the previous diagram with current theme
+- `:begin` / `:end` for multi-line diagram input
+- `:clear` command to remove session temp files
+- `:help` command for REPL reference
+- Arrow-key history persisted across sessions
+
 ## [0.1.1] - 2026-04-18
 
 ### Added

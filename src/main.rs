@@ -1,9 +1,14 @@
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
+
 const MERMAID_JS: &str = include_str!("../mermaid.min.js");
+
+const VALID_THEMES: &[&str] = &["default", "dark", "forest", "neutral", "base"];
 
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -12,7 +17,7 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn build_html(diagram: &str) -> String {
+fn build_html(diagram: &str, theme: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -85,7 +90,7 @@ fn build_html(diagram: &str) -> String {
 <script>
 mermaid.initialize({{
   startOnLoad: true,
-  theme: 'default',
+  theme: '{}',
   securityLevel: 'loose',
   flowchart: {{
     nodeSpacing: 100,
@@ -170,6 +175,7 @@ setTimeout(() => {{
 </html>"#,
         html_escape(diagram),
         MERMAID_JS,
+        theme,
     )
 }
 
@@ -203,8 +209,12 @@ fn parse_args() -> (Option<PathBuf>, String, bool) {
     }
 }
 
-fn render_diagram(input: &str, temp_dir_override: Option<&PathBuf>) -> io::Result<()> {
-    let html = build_html(input);
+fn render_diagram(
+    input: &str,
+    theme: &str,
+    temp_dir_override: Option<&PathBuf>,
+) -> io::Result<PathBuf> {
+    let html = build_html(input, theme);
 
     let dir = get_temp_dir(temp_dir_override.cloned())?;
     let filename = format!(
@@ -225,7 +235,7 @@ fn render_diagram(input: &str, temp_dir_override: Option<&PathBuf>) -> io::Resul
         eprintln!("Failed to open browser. File saved at: {}", tmp.display());
     }
 
-    Ok(())
+    Ok(tmp)
 }
 
 fn print_help() {
@@ -259,6 +269,22 @@ EXAMPLES:
     );
 }
 
+fn print_repl_help() {
+    println!(
+        r#"
+REPL Commands:
+  :theme <name>      Set diagram theme (default, dark, forest, neutral, base)
+  :save [path]       Save last rendered HTML (default: ./mermaid-N.html)
+  :load <path>       Load and render a mermaid file
+  :last              Re-render the last diagram
+  :begin / :end      Multi-line input mode
+  :help              Show this help
+  :clear             Remove rendered temp files
+  exit / quit        Exit (cleans temp files)
+"#
+    );
+}
+
 fn strip_wrapper_quotes(s: &str) -> &str {
     if s.len() < 2 {
         return s;
@@ -276,6 +302,266 @@ fn strip_wrapper_quotes(s: &str) -> &str {
     }
 }
 
+enum ReplCommand {
+    Render(String),
+    Theme(String),
+    Save(Option<String>),
+    Load(String),
+    Last,
+    Begin,
+    End,
+    Help,
+    Clear,
+    Unknown(String),
+}
+
+struct ReplSession {
+    theme: String,
+    last_input: Option<String>,
+    rendered_files: Vec<PathBuf>,
+    multiline: bool,
+    multiline_buf: String,
+}
+
+impl ReplSession {
+    fn new() -> Self {
+        Self {
+            theme: "default".to_string(),
+            last_input: None,
+            rendered_files: Vec::new(),
+            multiline: false,
+            multiline_buf: String::new(),
+        }
+    }
+
+    fn parse_command(&self, input: &str) -> ReplCommand {
+        let stripped = strip_wrapper_quotes(input);
+        if !stripped.starts_with(':') {
+            return ReplCommand::Render(stripped.to_string());
+        }
+
+        let rest = &stripped[1..];
+        let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
+
+        match parts[0] {
+            "theme" => {
+                if let Some(name) = parts.get(1) {
+                    ReplCommand::Theme(name.trim().to_string())
+                } else {
+                    ReplCommand::Unknown(":theme requires a name".to_string())
+                }
+            }
+            "save" => {
+                let path = parts.get(1).map(|s| s.trim().to_string());
+                ReplCommand::Save(path)
+            }
+            "load" => {
+                if let Some(path) = parts.get(1) {
+                    ReplCommand::Load(path.trim().to_string())
+                } else {
+                    ReplCommand::Unknown(":load requires a path".to_string())
+                }
+            }
+            "last" => ReplCommand::Last,
+            "begin" => ReplCommand::Begin,
+            "end" => ReplCommand::End,
+            "help" => ReplCommand::Help,
+            "clear" => ReplCommand::Clear,
+            _ => ReplCommand::Unknown(format!(":{}", parts[0])),
+        }
+    }
+
+    fn handle_theme(&mut self, name: &str) -> Result<(), String> {
+        let theme = name.to_lowercase();
+        if VALID_THEMES.contains(&theme.as_str()) {
+            self.theme = theme;
+            Ok(())
+        } else {
+            Err(format!(
+                "Invalid theme '{}'. Valid: {}",
+                name,
+                VALID_THEMES.join(", ")
+            ))
+        }
+    }
+
+    fn handle_save(&self, path: Option<&str>) -> Result<(), String> {
+        let last_file = self
+            .rendered_files
+            .last()
+            .ok_or_else(|| "Nothing to save. Render a diagram first.".to_string())?;
+
+        let dest = match path {
+            Some(p) => PathBuf::from(p),
+            None => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                PathBuf::from(format!("mermaid-{}.html", ts))
+            }
+        };
+
+        fs::copy(last_file, &dest).map_err(|e| format!("Failed to save: {}", e))?;
+        println!("Saved to {}", dest.display());
+        Ok(())
+    }
+
+    fn handle_load(&self, path: &str) -> Result<String, String> {
+        let content =
+            fs::read_to_string(path).map_err(|e| format!("Failed to load '{}': {}", path, e))?;
+        Ok(content)
+    }
+
+    fn handle_clear(&mut self) {
+        let count = self.rendered_files.len();
+        for file in &self.rendered_files {
+            let _ = fs::remove_file(file);
+        }
+        self.rendered_files.clear();
+        println!("Cleared {} temp file(s).", count);
+    }
+}
+
+fn run_repl(temp_dir_override: Option<PathBuf>) -> io::Result<()> {
+    let mut rl = DefaultEditor::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    let history_path = dirs::config_local_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .map(|p| p.join("mmd-viewer").join("history"));
+
+    if let Some(ref path) = history_path {
+        if path.exists() {
+            let _ = rl.load_history(path);
+        }
+    }
+
+    let mut session = ReplSession::new();
+
+    println!("mmd-viewer - Interactive Mermaid Diagram Renderer");
+    println!("Type a Mermaid string and press Enter to render.");
+    println!("Type ':help' for commands, 'exit' or Ctrl+D to quit.\n");
+
+    loop {
+        let prompt = if session.multiline { ".. " } else { "> " };
+        match rl.readline(prompt) {
+            Ok(line) => {
+                let _ = rl.add_history_entry(&line);
+
+                if session.multiline {
+                    let trimmed = line.trim();
+                    if trimmed.eq_ignore_ascii_case(":end") {
+                        session.multiline = false;
+                        let input = std::mem::take(&mut session.multiline_buf);
+                        match render_diagram(&input, &session.theme, temp_dir_override.as_ref()) {
+                            Ok(path) => {
+                                session.rendered_files.push(path);
+                                session.last_input = Some(input);
+                                println!("Rendered!\n");
+                            }
+                            Err(e) => eprintln!("Error: {}\n", e),
+                        }
+                    } else {
+                        if !session.multiline_buf.is_empty() {
+                            session.multiline_buf.push('\n');
+                        }
+                        session.multiline_buf.push_str(trimmed);
+                    }
+                    continue;
+                }
+
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
+                    println!("Bye!");
+                    break;
+                }
+
+                let cmd = session.parse_command(trimmed);
+                match cmd {
+                    ReplCommand::Render(input) => {
+                        match render_diagram(&input, &session.theme, temp_dir_override.as_ref()) {
+                            Ok(path) => {
+                                session.rendered_files.push(path);
+                                session.last_input = Some(input);
+                                println!("Rendered!\n");
+                            }
+                            Err(e) => eprintln!("Error: {}\n", e),
+                        }
+                    }
+                    ReplCommand::Theme(name) => match session.handle_theme(&name) {
+                        Ok(()) => println!("Theme set to '{}'.\n", name),
+                        Err(e) => eprintln!("{}\n", e),
+                    },
+                    ReplCommand::Save(path) => match session.handle_save(path.as_deref()) {
+                        Ok(()) => println!(),
+                        Err(e) => eprintln!("{}\n", e),
+                    },
+                    ReplCommand::Load(path) => match session.handle_load(&path) {
+                        Ok(content) => {
+                            let input = strip_wrapper_quotes(content.trim()).to_string();
+                            match render_diagram(&input, &session.theme, temp_dir_override.as_ref())
+                            {
+                                Ok(file_path) => {
+                                    session.rendered_files.push(file_path);
+                                    session.last_input = Some(input);
+                                    println!("Rendered!\n");
+                                }
+                                Err(e) => eprintln!("Error: {}\n", e),
+                            }
+                        }
+                        Err(e) => eprintln!("{}\n", e),
+                    },
+                    ReplCommand::Last => match &session.last_input {
+                        Some(input) => {
+                            match render_diagram(input, &session.theme, temp_dir_override.as_ref())
+                            {
+                                Ok(path) => {
+                                    session.rendered_files.push(path);
+                                    println!("Re-rendered!\n");
+                                }
+                                Err(e) => eprintln!("Error: {}\n", e),
+                            }
+                        }
+                        None => eprintln!("No previous diagram to re-render.\n"),
+                    },
+                    ReplCommand::Begin => {
+                        session.multiline = true;
+                        session.multiline_buf.clear();
+                        println!("Multi-line mode. Type ':end' to render.\n");
+                    }
+                    ReplCommand::End => {
+                        eprintln!("Not in multi-line mode. Type ':begin' first.\n");
+                    }
+                    ReplCommand::Help => print_repl_help(),
+                    ReplCommand::Clear => session.handle_clear(),
+                    ReplCommand::Unknown(msg) => eprintln!("Unknown command: {}\n", msg),
+                }
+            }
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+                println!("\nBye!");
+                break;
+            }
+            Err(err) => eprintln!("Error: {:?}", err),
+        }
+    }
+
+    if let Some(ref path) = history_path {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = rl.save_history(path);
+    }
+
+    for file in &session.rendered_files {
+        let _ = fs::remove_file(file);
+    }
+
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     let (temp_dir_override, cli_input, show_help) = parse_args();
 
@@ -285,7 +571,8 @@ fn main() -> io::Result<()> {
     }
 
     if !cli_input.is_empty() {
-        return render_diagram(&cli_input, temp_dir_override.as_ref());
+        render_diagram(&cli_input, "default", temp_dir_override.as_ref())?;
+        return Ok(());
     }
 
     if !io::stdin().is_terminal() {
@@ -295,39 +582,9 @@ fn main() -> io::Result<()> {
             eprintln!("Error: no input provided");
             std::process::exit(1);
         }
-        return render_diagram(&buf, temp_dir_override.as_ref());
+        render_diagram(&buf, "default", temp_dir_override.as_ref())?;
+        return Ok(());
     }
 
-    println!("mmd-viewer - Interactive Mermaid Diagram Renderer");
-    println!("Type a Mermaid string and press Enter to render.");
-    println!("Type 'exit' or press Ctrl+C to quit.\n");
-
-    let mut line = String::new();
-    loop {
-        print!("> ");
-        io::stdout().flush()?;
-
-        line.clear();
-        match io::stdin().read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
-            println!("Bye!");
-            break;
-        }
-
-        let input = strip_wrapper_quotes(trimmed);
-        match render_diagram(input, temp_dir_override.as_ref()) {
-            Ok(()) => println!("Rendered!\n"),
-            Err(e) => eprintln!("Error: {}\n", e),
-        }
-    }
-
-    Ok(())
+    run_repl(temp_dir_override)
 }

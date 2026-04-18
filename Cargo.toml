@@ -1,7 +1,7 @@
 [package]
 name = "mmd-viewer"
-version = "0.1.0"
-edition = "2021"
+version = "0.1.1"
+edition = "2024"
 description = "Instantly render Mermaid diagrams in your browser from the CLI"
 homepage = "https://github.com/MariusAdrian88/mmd-viewer"
 repository = "https://github.com/MariusAdrian88/mmd-viewer"

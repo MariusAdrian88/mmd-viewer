@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 const MERMAID_JS: &str = include_str!("../mermaid.min.js");
@@ -180,10 +180,14 @@ fn get_temp_dir(override_dir: Option<PathBuf>) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-fn parse_args() -> (Option<PathBuf>, String) {
+fn parse_args() -> (Option<PathBuf>, String, bool) {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
-        return (None, String::new());
+        return (None, String::new(), false);
+    }
+
+    if args[0] == "--help" || args[0] == "-h" {
+        return (None, String::new(), true);
     }
 
     if args[0] == "--temp-dir" {
@@ -193,31 +197,16 @@ fn parse_args() -> (Option<PathBuf>, String) {
         }
         let temp_dir = PathBuf::from(&args[1]);
         let input = args[2..].join(" ");
-        (Some(temp_dir), input)
+        (Some(temp_dir), input, false)
     } else {
-        (None, args.join(" "))
+        (None, args.join(" "), false)
     }
 }
 
-fn main() -> io::Result<()> {
-    let (temp_dir_override, cli_input) = parse_args();
+fn render_diagram(input: &str, temp_dir_override: Option<&PathBuf>) -> io::Result<()> {
+    let html = build_html(input);
 
-    let input = if !cli_input.is_empty() {
-        cli_input
-    } else {
-        let mut buf = String::new();
-        io::stdin().read_to_string(&mut buf)?;
-        buf
-    };
-
-    if input.trim().is_empty() {
-        eprintln!("Usage: mmd-viewer [--temp-dir PATH] \"mermaid string\" or pipe via stdin");
-        std::process::exit(1);
-    }
-
-    let html = build_html(&input);
-
-    let dir = get_temp_dir(temp_dir_override)?;
+    let dir = get_temp_dir(temp_dir_override.cloned())?;
     let filename = format!(
         "mermaid-{}-{}.html",
         std::process::id(),
@@ -234,7 +223,110 @@ fn main() -> io::Result<()> {
 
     if webbrowser::open(&uri).is_err() {
         eprintln!("Failed to open browser. File saved at: {}", tmp.display());
-        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn print_help() {
+    println!(
+        r#"mmd-viewer - Instantly render Mermaid diagrams in your browser
+
+USAGE:
+    mmd-viewer [OPTIONS] [MERMAID_STRING]
+    mmd-viewer [OPTIONS] < stdin
+
+OPTIONS:
+    --temp-dir PATH    Override the default temp directory for generated HTML files
+    -h, --help         Print this help message
+
+MODES:
+    Interactive mode   Run without arguments to enter interactive mode.
+                       Type a Mermaid string and press Enter to render it.
+                       Type 'exit' or press Ctrl+C to quit.
+
+    CLI mode           Pass a Mermaid string directly as arguments:
+                       mmd-viewer "graph TD; A-->B;"
+
+    Pipe mode          Pipe Mermaid content from another command:
+                       echo "graph TD; A-->B;" | mmd-viewer
+                       cat diagram.mmd | mmd-viewer
+
+EXAMPLES:
+    mmd-viewer "graph TD; A-->B; B-->C;"
+    mmd-viewer --temp-dir ./output "sequenceDiagram; A->>B: Hello"
+    echo "graph LR; A[Login]-->B[Dashboard]; B-->C[Settings];" | mmd-viewer"#
+    );
+}
+
+fn strip_wrapper_quotes(s: &str) -> &str {
+    if s.len() < 2 {
+        return s;
+    }
+    let bytes = s.as_bytes();
+    let first = bytes[0];
+    let last = bytes[bytes.len() - 1];
+    if (first == b'"' && last == b'"')
+        || (first == b'\'' && last == b'\'')
+        || (first == b'`' && last == b'`')
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+fn main() -> io::Result<()> {
+    let (temp_dir_override, cli_input, show_help) = parse_args();
+
+    if show_help {
+        print_help();
+        return Ok(());
+    }
+
+    if !cli_input.is_empty() {
+        return render_diagram(&cli_input, temp_dir_override.as_ref());
+    }
+
+    if !io::stdin().is_terminal() {
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf)?;
+        if buf.trim().is_empty() {
+            eprintln!("Error: no input provided");
+            std::process::exit(1);
+        }
+        return render_diagram(&buf, temp_dir_override.as_ref());
+    }
+
+    println!("mmd-viewer - Interactive Mermaid Diagram Renderer");
+    println!("Type a Mermaid string and press Enter to render.");
+    println!("Type 'exit' or press Ctrl+C to quit.\n");
+
+    let mut line = String::new();
+    loop {
+        print!("> ");
+        io::stdout().flush()?;
+
+        line.clear();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
+            println!("Bye!");
+            break;
+        }
+
+        let input = strip_wrapper_quotes(trimmed);
+        match render_diagram(input, temp_dir_override.as_ref()) {
+            Ok(()) => println!("Rendered!\n"),
+            Err(e) => eprintln!("Error: {}\n", e),
+        }
     }
 
     Ok(())

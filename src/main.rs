@@ -245,7 +245,7 @@ fn highlight_line(line: &str) -> String {
         // Words (keywords or regular text)
         if chars[i].is_alphabetic() || chars[i] == '_' {
             let start = i;
-            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '-') {
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();

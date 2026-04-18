@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-04-18
+
+### Added
+
+- REPL syntax highlighting for commands, keywords, arrows, and strings
+- Tab completion for REPL commands, themes, and file paths
+- Line validation and history hints in REPL
+
 ## [0.1.2] - 2026-04-18
 
 ### Added

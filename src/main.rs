@@ -1,14 +1,270 @@
+use std::borrow::Cow;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 
+use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::hint::HistoryHinter;
+use rustyline::validate::MatchingBracketValidator;
+use rustyline::validate::Validator;
+use rustyline::Editor;
+use rustyline::Helper;
 
 const MERMAID_JS: &str = include_str!("../mermaid.min.js");
 
+const MERMAID_KEYWORDS: &[&str] = &[
+    "graph",
+    "flowchart",
+    "sequenceDiagram",
+    "classDiagram",
+    "stateDiagram",
+    "stateDiagram-v2",
+    "pie",
+    "gantt",
+    "gitgraph",
+    "erDiagram",
+    "journey",
+    "subgraph",
+    "end",
+    "classDef",
+    "linkStyle",
+    "click",
+    "callback",
+    "participant",
+    "actor",
+    "note",
+    "loop",
+    "alt",
+    "opt",
+    "par",
+    "rect",
+    "title",
+    "section",
+    "exclude",
+    "includes",
+    "todayMarker",
+    "TD",
+    "TB",
+    "BT",
+    "LR",
+    "RL",
+];
+
+const RESET: &str = "\x1b[0m";
+const DARK_ORANGE: &str = "\x1b[38;5;166m";
+const DIM: &str = "\x1b[90m";
+const MAGENTA: &str = "\x1b[95m";
+const GREEN: &str = "\x1b[92m";
+
 const VALID_THEMES: &[&str] = &["default", "dark", "forest", "neutral", "base"];
+
+struct MmdHelper {
+    validator: MatchingBracketValidator,
+    hinter: HistoryHinter,
+    file_completer: FilenameCompleter,
+}
+
+impl Helper for MmdHelper {}
+
+impl Completer for MmdHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let trimmed = line.trim();
+        if trimmed.starts_with(':') {
+            let prefix = &trimmed[1..];
+            let space_pos = prefix.find(char::is_whitespace);
+            let cmd_prefix = match space_pos {
+                Some(p) => &prefix[..p],
+                None => prefix,
+            };
+
+            let commands = [
+                "theme", "save", "load", "last", "begin", "end", "help", "clear",
+            ];
+            let matches: Vec<Pair> = commands
+                .iter()
+                .filter(|c| c.starts_with(cmd_prefix))
+                .map(|c| Pair {
+                    display: format!(":{}", c),
+                    replacement: format!(":{} ", c),
+                })
+                .collect();
+
+            if !matches.is_empty() {
+                return Ok((0, matches));
+            }
+        }
+
+        if trimmed.starts_with(":load ") || trimmed.starts_with(":save ") {
+            return self.file_completer.complete(line, pos, ctx);
+        }
+
+        if trimmed.starts_with(":theme ") {
+            let after_theme = trimmed[7..].trim_start();
+            let themes = ["default", "dark", "forest", "neutral", "base"];
+            let matches: Vec<Pair> = themes
+                .iter()
+                .filter(|t| t.starts_with(after_theme))
+                .map(|t| Pair {
+                    display: t.to_string(),
+                    replacement: format!(":theme {} ", t),
+                })
+                .collect();
+
+            if !matches.is_empty() {
+                return Ok((0, matches));
+            }
+        }
+
+        Ok((pos, Vec::new()))
+    }
+}
+
+impl Validator for MmdHelper {
+    fn validate(
+        &self,
+        ctx: &mut rustyline::validate::ValidationContext,
+    ) -> rustyline::Result<rustyline::validate::ValidationResult> {
+        self.validator.validate(ctx)
+    }
+
+    fn validate_while_typing(&self) -> bool {
+        self.validator.validate_while_typing()
+    }
+}
+
+impl Hinter for MmdHelper {
+    type Hint = String;
+    fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<String> {
+        self.hinter.hint(line, pos, ctx)
+    }
+}
+
+impl Highlighter for MmdHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        Cow::Owned(highlight_line(line))
+    }
+
+    fn highlight_char(
+        &self,
+        _line: &str,
+        _pos: usize,
+        _kind: rustyline::highlight::CmdKind,
+    ) -> bool {
+        true
+    }
+}
+
+fn highlight_line(line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.starts_with(':') {
+        return format!("{}{}{}", DARK_ORANGE, line, RESET);
+    }
+
+    let mut result = String::with_capacity(line.len() + 64);
+    let chars: Vec<char> = line.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Quoted strings
+        if chars[i] == '"' || chars[i] == '\'' {
+            let quote = chars[i];
+            let start = i;
+            i += 1;
+            while i < len && chars[i] != quote {
+                if chars[i] == '\\' && i + 1 < len {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if i < len {
+                i += 1;
+            }
+            result.push_str(GREEN);
+            result.extend(&chars[start..i]);
+            result.push_str(RESET);
+            continue;
+        }
+
+        // Arrow operators
+        if i + 2 < len && &chars[i..i + 3] == ['-', '-', '>'] {
+            result.push_str(DARK_ORANGE);
+            result.push_str("-->");
+            result.push_str(RESET);
+            i += 3;
+            continue;
+        }
+        if i + 3 < len && &chars[i..i + 4] == ['-', '.', '-', '>'] {
+            result.push_str(DARK_ORANGE);
+            result.push_str("-.->");
+            result.push_str(RESET);
+            i += 4;
+            continue;
+        }
+        if i + 2 < len && &chars[i..i + 3] == ['=', '=', '>'] {
+            result.push_str(DARK_ORANGE);
+            result.push_str("==>");
+            result.push_str(RESET);
+            i += 3;
+            continue;
+        }
+        if i + 2 < len && &chars[i..i + 3] == ['-', '-', '-'] {
+            result.push_str(DIM);
+            result.push_str("---");
+            result.push_str(RESET);
+            i += 3;
+            continue;
+        }
+        if i + 1 < len && &chars[i..i + 2] == ['-', '.'] {
+            result.push_str(DARK_ORANGE);
+            result.push_str("-.");
+            result.push_str(RESET);
+            i += 2;
+            continue;
+        }
+        if i + 1 < len && &chars[i..i + 2] == ['=', '='] {
+            result.push_str(DARK_ORANGE);
+            result.push_str("==");
+            result.push_str(RESET);
+            i += 2;
+            continue;
+        }
+
+        // Words (keywords or regular text)
+        if chars[i].is_alphabetic() || chars[i] == '_' {
+            let start = i;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '-') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if MERMAID_KEYWORDS.contains(&word.as_str()) {
+                result.push_str(MAGENTA);
+                result.push_str(&word);
+                result.push_str(RESET);
+            } else {
+                result.push_str(&word);
+            }
+            continue;
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    result
+}
 
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -424,7 +680,13 @@ impl ReplSession {
 }
 
 fn run_repl(temp_dir_override: Option<PathBuf>) -> io::Result<()> {
-    let mut rl = DefaultEditor::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut rl = Editor::<MmdHelper, rustyline::history::DefaultHistory>::new()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    rl.set_helper(Some(MmdHelper {
+        validator: MatchingBracketValidator::new(),
+        hinter: HistoryHinter::new(),
+        file_completer: FilenameCompleter::new(),
+    }));
 
     let history_path = dirs::config_local_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))

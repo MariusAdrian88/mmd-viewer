@@ -492,7 +492,22 @@ fn run_repl(temp_dir_override: Option<PathBuf>) -> io::Result<()> {
                         }
                     }
                     ReplCommand::Theme(name) => match session.handle_theme(&name) {
-                        Ok(()) => println!("Theme set to '{}'.\n", name),
+                        Ok(()) => {
+                            println!("Theme set to '{}'.\n", name);
+                            if let Some(ref input) = session.last_input {
+                                match render_diagram(
+                                    input,
+                                    &session.theme,
+                                    temp_dir_override.as_ref(),
+                                ) {
+                                    Ok(path) => {
+                                        session.rendered_files.push(path);
+                                        println!("Re-rendered with new theme.\n");
+                                    }
+                                    Err(e) => eprintln!("Error: {}\n", e),
+                                }
+                            }
+                        }
                         Err(e) => eprintln!("{}\n", e),
                     },
                     ReplCommand::Save(path) => match session.handle_save(path.as_deref()) {
